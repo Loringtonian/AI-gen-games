@@ -55,6 +55,14 @@ RIGHT_CORNER_RIGHT_EYE = 133  # user right eye outer corner
 RIGHT_EYE_TOP = 159
 RIGHT_EYE_BOTTOM = 145
 
+# Outer eye corners used for approximate head yaw calculation
+LEFT_OUTER_EYE = 33
+RIGHT_OUTER_EYE = 263
+
+# Additional landmarks for head orientation
+NOSE_TIP = 1
+CHIN = 152
+
 LEFT_IRIS_CENTER = 468
 RIGHT_IRIS_CENTER = 473
 
@@ -197,9 +205,49 @@ class EyeControl:
         self.left_blink_counter = 0
         self.right_blink_counter = 0
         self.both_blink_cooldown = 0
-        self._calibrating = True
+        self._calibrating = False
         self._calib_samples: list[float] = []
-        self.neutral_ratio = 0.5  # will be overwritten after calibration
+        self._yaw_samples: list[float] = []
+        self._pitch_samples: list[float] = []
+        self._roll_samples: list[float] = []
+        self._vert_samples: list[float] = []
+        self.neutral_ratio = 0.5  # overwritten after calibration
+        self.neutral_yaw = 0.0
+        self.neutral_pitch = 0.0
+        self.neutral_roll = 0.0
+        self.neutral_vertical = 0.5
+        # extremes collected during manual calibration
+        self.yaw_left = None
+        self.yaw_right = None
+        self.pitch_up = None
+        self.pitch_down = None
+        self.roll_left = None
+        self.roll_right = None
+        self.gaze_left = None
+        self.gaze_right = None
+        self.gaze_up = None
+        self.gaze_down = None
+
+    def metrics(self, frame: np.ndarray):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = self.face_mesh.process(rgb)
+        if not results.multi_face_landmarks:
+            return None
+        face_landmarks = results.multi_face_landmarks[0].landmark
+        yaw_val = self._yaw_value(face_landmarks)
+        pitch_val = self._pitch_value(face_landmarks)
+        roll_val = self._roll_value(face_landmarks)
+
+        ratio_left = self._eye_gaze_ratio(face_landmarks, LEFT_IRIS_CENTER, LEFT_EYE_CORNERS)
+        ratio_right = self._eye_gaze_ratio(face_landmarks, RIGHT_IRIS_CENTER, RIGHT_EYE_CORNERS)
+        gaze_ratio = (ratio_left + ratio_right) / 2
+
+        v_left = self._eye_vertical_ratio(face_landmarks, LEFT_IRIS_CENTER, LEFT_EYE_TOP, LEFT_EYE_BOTTOM)
+        v_right = self._eye_vertical_ratio(face_landmarks, RIGHT_IRIS_CENTER, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM)
+        gaze_vertical = (v_left + v_right) / 2
+
+        return yaw_val, pitch_val, roll_val, gaze_ratio, gaze_vertical, face_landmarks
 
     def _eye_gaze_ratio(self, landmarks, iris_id: int, corner_ids: Tuple[int, int]):
         outer_id, inner_id = corner_ids  # outer = temple side, inner = nose side
@@ -208,27 +256,49 @@ class EyeControl:
         inner_x = landmarks[inner_id].x
         denom = inner_x - outer_x
         if denom == 0:
-            return 0.5  # avoid div‑by‑zero
+            return 0.5  # avoid div-by-zero
         return (iris_x - outer_x) / denom  # 0 (look outer) .. 1 (look inner / nose)
 
+    def _eye_vertical_ratio(self, landmarks, iris_id: int, top_id: int, bottom_id: int):
+        iris_y = landmarks[iris_id].y
+        top_y = landmarks[top_id].y
+        bottom_y = landmarks[bottom_id].y
+        denom = bottom_y - top_y
+        if denom == 0:
+            return 0.5
+        return (iris_y - top_y) / denom
+
+    def _yaw_value(self, landmarks):
+        left = landmarks[LEFT_OUTER_EYE].x
+        right = landmarks[RIGHT_OUTER_EYE].x
+        return right - left
+
+    def _pitch_value(self, landmarks):
+        nose = landmarks[NOSE_TIP]
+        chin = landmarks[CHIN]
+        dy = chin.y - nose.y
+        dz = chin.z - nose.z
+        return np.degrees(np.arctan2(dz, dy))
+
+    def _roll_value(self, landmarks):
+        left = landmarks[LEFT_OUTER_EYE]
+        right = landmarks[RIGHT_OUTER_EYE]
+        dy = right.y - left.y
+        dx = right.x - left.x
+        return np.degrees(np.arctan2(dy, dx))
+
     def process(self, frame: np.ndarray):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = self.face_mesh.process(rgb)
+        metrics = self.metrics(frame)
         gaze_ratio = None
+        gaze_vertical = None
+        yaw_val = None
+        pitch_val = None
+        roll_val = None
         blink_left = False
         blink_right = False
         blink_both = False
-        if results.multi_face_landmarks:
-            face_landmarks = results.multi_face_landmarks[0].landmark
-            # face bounding box for head‑movement compensation
-            xs = [lm.x for lm in face_landmarks]
-            x_min, x_max = min(xs), max(xs)
-            # Iris center average
-            iris_x = (
-                face_landmarks[LEFT_IRIS_CENTER].x + face_landmarks[RIGHT_IRIS_CENTER].x
-            ) / 2.0
-            gaze_ratio = (iris_x - x_min) / (x_max - x_min)
+        if metrics:
+            yaw_val, pitch_val, roll_val, gaze_ratio, gaze_vertical, face_landmarks = metrics
             # EAR for eyes
             ear_left = eye_aspect_ratio(
                 face_landmarks,
@@ -265,25 +335,119 @@ class EyeControl:
                 blink_left = False
                 blink_right = False
 
-            # --- Improved gaze ratio ---
-            ratio_left = self._eye_gaze_ratio(
-                face_landmarks, LEFT_IRIS_CENTER, LEFT_EYE_CORNERS
-            )
-            ratio_right = self._eye_gaze_ratio(
-                face_landmarks, RIGHT_IRIS_CENTER, RIGHT_EYE_CORNERS
-            )
-            gaze_ratio = (ratio_left + ratio_right) / 2  # 0 = looking towards temples (left), 1 = towards nose/right
-
-            # Auto‑calibration during first 50 valid frames
+            # Auto-calibration during first 50 valid frames
             if self._calibrating:
                 self._calib_samples.append(gaze_ratio)
+                self._yaw_samples.append(yaw_val)
+                self._pitch_samples.append(pitch_val)
+                self._roll_samples.append(roll_val)
+                self._vert_samples.append(gaze_vertical)
                 if len(self._calib_samples) >= 50:
                     self.neutral_ratio = float(np.mean(self._calib_samples))
+                    self.neutral_yaw = float(np.mean(self._yaw_samples))
+                    self.neutral_pitch = float(np.mean(self._pitch_samples))
+                    self.neutral_roll = float(np.mean(self._roll_samples))
+                    self.neutral_vertical = float(np.mean(self._vert_samples))
                     self._calibrating = False
-            # Shift so neutral gaze centres piece
-            gaze_ratio = np.clip((gaze_ratio - (self.neutral_ratio - 0.5)), 0.0, 1.0)
+
+            # Adjust gaze using calibration and compensate for head orientation
+            gaze_ratio -= (self.neutral_ratio - 0.5)
+            gaze_ratio += (self.neutral_yaw - yaw_val)
+            gaze_ratio += (self.neutral_roll - roll_val) * 0.5
+            gaze_ratio = np.clip(gaze_ratio, 0.0, 1.0)
 
         return gaze_ratio, blink_left, blink_right, blink_both
+
+# ---------------------------
+#   CALIBRATION ROUTINE
+# ---------------------------
+
+def run_calibration(screen, cap, eye_ctl: EyeControl, clock):
+    font = pygame.font.SysFont("Arial", 32)
+    info_text = font.render(
+        "Press SPACE to begin calibration", True, (255, 255, 255)
+    )
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                raise KeyboardInterrupt
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                break
+        else:
+            screen.fill((0, 0, 0))
+            rect = info_text.get_rect(center=(screen.get_width() // 2, screen.get_height() // 2))
+            screen.blit(info_text, rect)
+            pygame.display.flip()
+            clock.tick(30)
+            continue
+        break
+
+    steps = [
+        ("Hold head straight, look forward", "neutral"),
+        ("Move head left", "yaw_left"),
+        ("Move head right", "yaw_right"),
+        ("Tilt head up", "pitch_up"),
+        ("Tilt head down", "pitch_down"),
+        ("Roll head left", "roll_left"),
+        ("Roll head right", "roll_right"),
+        ("Look left", "gaze_left"),
+        ("Look right", "gaze_right"),
+        ("Look up", "gaze_up"),
+        ("Look down", "gaze_down"),
+    ]
+
+    for text, attr in steps:
+        instruction = font.render(text, True, (255, 255, 255))
+        samples = []
+        for i in range(30):
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    raise KeyboardInterrupt
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            metrics = eye_ctl.metrics(frame)
+            if metrics:
+                yaw, pitch, roll, gaze, vert, _ = metrics
+                samples.append((yaw, pitch, roll, gaze, vert))
+
+            screen.fill((0, 0, 0))
+            rect = instruction.get_rect(center=(screen.get_width() // 2, screen.get_height() // 2))
+            screen.blit(instruction, rect)
+            pygame.display.flip()
+            clock.tick(30)
+
+        if not samples:
+            continue
+        avg = np.mean(samples, axis=0)
+        if attr == "neutral":
+            eye_ctl.neutral_yaw = avg[0]
+            eye_ctl.neutral_pitch = avg[1]
+            eye_ctl.neutral_roll = avg[2]
+            eye_ctl.neutral_ratio = avg[3]
+            eye_ctl.neutral_vertical = avg[4]
+        elif attr == "yaw_left":
+            eye_ctl.yaw_left = avg[0]
+        elif attr == "yaw_right":
+            eye_ctl.yaw_right = avg[0]
+        elif attr == "pitch_up":
+            eye_ctl.pitch_up = avg[1]
+        elif attr == "pitch_down":
+            eye_ctl.pitch_down = avg[1]
+        elif attr == "roll_left":
+            eye_ctl.roll_left = avg[2]
+        elif attr == "roll_right":
+            eye_ctl.roll_right = avg[2]
+        elif attr == "gaze_left":
+            eye_ctl.gaze_left = avg[3]
+        elif attr == "gaze_right":
+            eye_ctl.gaze_right = avg[3]
+        elif attr == "gaze_up":
+            eye_ctl.gaze_up = avg[4]
+        elif attr == "gaze_down":
+            eye_ctl.gaze_down = avg[4]
+
+    eye_ctl._calibrating = False
 
 # ---------------------------
 #      RENDERING HELPERS
@@ -357,6 +521,8 @@ def main():
 
     gaze_history: deque = deque(maxlen=5)
 
+    run_calibration(screen, cap, eye_ctl, clock)
+
     try:
         while True:
             # Pygame events
@@ -366,9 +532,8 @@ def main():
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE and board.game_over:
                     # restart game
                     board = Board()
-                    eye_ctl._calibrating = True
-                    eye_ctl._calib_samples.clear()
                     gaze_history.clear()
+                    run_calibration(screen, cap, eye_ctl, clock)
 
             # Capture frame
             ret, frame = cap.read()
