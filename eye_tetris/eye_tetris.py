@@ -23,9 +23,13 @@ BLINK_COOLDOWN_FRAMES = 15  # Prevent rapid-fire blinks
 
 # Gaze control parameters
 GAZE_HISTORY_SIZE = 15  # More frames for smoother tracking
-GAZE_DEAD_ZONE = 0.15  # Center dead zone (no movement when gaze is within this range of center)
-MOVEMENT_COOLDOWN_FRAMES = 8  # Only move piece every N frames
-GAZE_SENSITIVITY = 1.2  # Amplify gaze movement outside dead zone
+GAZE_DEAD_ZONE = 0.12  # Center dead zone (reduced since calibration improves accuracy)
+MOVEMENT_COOLDOWN_FRAMES = 6  # Only move piece every N frames
+GAZE_SENSITIVITY = 1.0  # Reduced since calibration handles range mapping
+
+# Calibration parameters
+CALIBRATION_SAMPLES = 45  # Samples to collect per calibration point
+CALIBRATION_SETTLE_FRAMES = 30  # Wait frames before collecting samples
 
 # Colors in RGB
 COLORS = {
@@ -204,13 +208,91 @@ class EyeControl:
         self.left_blink_counter = 0
         self.right_blink_counter = 0
         self.blink_cooldown = 0  # Cooldown counter for all blinks
-        self._calibrating = True
-        self._calib_samples: list[float] = []
-        self.neutral_ratio = 0.5  # will be overwritten after calibration
+
+        # 3-point calibration state
+        # States: "left", "center", "right", "done"
+        self.calib_state = "left"
+        self.calib_settle_counter = 0  # Wait before collecting samples
+        self.calib_samples: list[float] = []
+        # Calibrated gaze boundaries (raw gaze values)
+        self.gaze_left = 0.3   # Will be calibrated
+        self.gaze_center = 0.5  # Will be calibrated
+        self.gaze_right = 0.7   # Will be calibrated
+
         # Track raw gaze for debugging overlay
         self.raw_gaze = 0.5
         self.ear_left = 0.0
         self.ear_right = 0.0
+
+    def reset_calibration(self):
+        """Reset calibration to start fresh."""
+        self.calib_state = "left"
+        self.calib_settle_counter = 0
+        self.calib_samples.clear()
+
+    def is_calibrating(self) -> bool:
+        return self.calib_state != "done"
+
+    def get_calibration_progress(self) -> Tuple[str, float]:
+        """Returns (current_target, progress 0-1)."""
+        if self.calib_state == "done":
+            return ("done", 1.0)
+        if self.calib_settle_counter < CALIBRATION_SETTLE_FRAMES:
+            return (self.calib_state, 0.0)
+        progress = len(self.calib_samples) / CALIBRATION_SAMPLES
+        return (self.calib_state, progress)
+
+    def _advance_calibration(self, gaze_value: float):
+        """Process a gaze sample during calibration."""
+        # Wait for user to settle on target
+        if self.calib_settle_counter < CALIBRATION_SETTLE_FRAMES:
+            self.calib_settle_counter += 1
+            return
+
+        # Collect samples
+        self.calib_samples.append(gaze_value)
+
+        if len(self.calib_samples) >= CALIBRATION_SAMPLES:
+            # Average the samples for this point
+            avg = float(np.mean(self.calib_samples))
+
+            if self.calib_state == "left":
+                self.gaze_left = avg
+                self.calib_state = "center"
+            elif self.calib_state == "center":
+                self.gaze_center = avg
+                self.calib_state = "right"
+            elif self.calib_state == "right":
+                self.gaze_right = avg
+                self.calib_state = "done"
+                # Validate calibration (ensure left < center < right)
+                if not (self.gaze_left < self.gaze_center < self.gaze_right):
+                    # Swap if inverted (camera might be mirrored)
+                    if self.gaze_left > self.gaze_right:
+                        self.gaze_left, self.gaze_right = self.gaze_right, self.gaze_left
+
+            # Reset for next point
+            self.calib_samples.clear()
+            self.calib_settle_counter = 0
+
+    def map_gaze_calibrated(self, raw_gaze: float) -> float:
+        """Map raw gaze value to 0-1 range using calibration data."""
+        if self.calib_state != "done":
+            return 0.5  # Return center during calibration
+
+        # Use piecewise linear mapping based on calibration
+        if raw_gaze <= self.gaze_center:
+            # Map left half: gaze_left->0, gaze_center->0.5
+            if self.gaze_center == self.gaze_left:
+                return 0.5
+            t = (raw_gaze - self.gaze_left) / (self.gaze_center - self.gaze_left)
+            return np.clip(t * 0.5, 0.0, 0.5)
+        else:
+            # Map right half: gaze_center->0.5, gaze_right->1.0
+            if self.gaze_right == self.gaze_center:
+                return 0.5
+            t = (raw_gaze - self.gaze_center) / (self.gaze_right - self.gaze_center)
+            return np.clip(0.5 + t * 0.5, 0.5, 1.0)
 
     def _eye_gaze_ratio(self, landmarks, iris_id: int, corner_ids: Tuple[int, int]):
         outer_id, inner_id = corner_ids  # outer = temple side, inner = nose side
@@ -298,14 +380,13 @@ class EyeControl:
             gaze_ratio = (ratio_left + ratio_right) / 2  # 0 = looking towards temples (left), 1 = towards nose/right
             self.raw_gaze = gaze_ratio  # Store for debug overlay
 
-            # Auto‑calibration during first 60 valid frames (longer for stability)
-            if self._calibrating:
-                self._calib_samples.append(gaze_ratio)
-                if len(self._calib_samples) >= 60:
-                    self.neutral_ratio = float(np.mean(self._calib_samples))
-                    self._calibrating = False
-            # Shift so neutral gaze centres piece
-            gaze_ratio = np.clip((gaze_ratio - (self.neutral_ratio - 0.5)), 0.0, 1.0)
+            # 3-point calibration
+            if self.is_calibrating():
+                self._advance_calibration(gaze_ratio)
+                gaze_ratio = 0.5  # Keep piece centered during calibration
+            else:
+                # Map raw gaze using calibrated values
+                gaze_ratio = self.map_gaze_calibrated(gaze_ratio)
 
         return gaze_ratio, blink_left, blink_right, blink_both
 
@@ -351,6 +432,91 @@ def draw_board(screen, board: Board):
             (BOARD_WIDTH * BLOCK_W, y * BLOCK_H),
         )
 
+def draw_calibration(screen, eye_ctl: EyeControl, screen_width: int, screen_height: int):
+    """Draw calibration overlay with target indicators."""
+    screen.fill((20, 20, 40))  # Dark blue background
+
+    target, progress = eye_ctl.get_calibration_progress()
+
+    # Target positions (left edge, center, right edge)
+    target_positions = {
+        "left": (50, screen_height // 2),
+        "center": (screen_width // 2, screen_height // 2),
+        "right": (screen_width - 50, screen_height // 2),
+    }
+
+    # Draw all targets (dimmed for non-active)
+    for name, (tx, ty) in target_positions.items():
+        if name == target:
+            # Active target - bright pulsing circle
+            pulse = int(20 * np.sin(time.time() * 5) + 35)
+            color = (255, 255, 100)
+            pygame.draw.circle(screen, color, (tx, ty), pulse, 0)
+            pygame.draw.circle(screen, (255, 255, 255), (tx, ty), 8, 0)
+        else:
+            # Inactive target - dim
+            done_targets = []
+            if eye_ctl.calib_state == "center":
+                done_targets = ["left"]
+            elif eye_ctl.calib_state == "right":
+                done_targets = ["left", "center"]
+            elif eye_ctl.calib_state == "done":
+                done_targets = ["left", "center", "right"]
+
+            if name in done_targets:
+                # Completed - green
+                pygame.draw.circle(screen, (0, 180, 0), (tx, ty), 20, 2)
+                pygame.draw.circle(screen, (0, 120, 0), (tx, ty), 5, 0)
+            else:
+                # Not yet - gray
+                pygame.draw.circle(screen, (80, 80, 80), (tx, ty), 20, 2)
+
+    # Draw instructions
+    font_large = pygame.font.SysFont("Arial", 28)
+    font_small = pygame.font.SysFont("Arial", 18)
+
+    if target != "done":
+        # Show which target to look at
+        direction_text = {"left": "LEFT", "center": "CENTER", "right": "RIGHT"}
+        instruction = f"Look at the {direction_text[target]} target"
+
+        txt = font_large.render(instruction, True, (255, 255, 255))
+        rect = txt.get_rect(center=(screen_width // 2, 60))
+        screen.blit(txt, rect)
+
+        # Progress bar
+        bar_width = 200
+        bar_height = 20
+        bar_x = (screen_width - bar_width) // 2
+        bar_y = 100
+        pygame.draw.rect(screen, (60, 60, 60), (bar_x, bar_y, bar_width, bar_height))
+        pygame.draw.rect(screen, (100, 200, 100), (bar_x, bar_y, int(bar_width * progress), bar_height))
+        pygame.draw.rect(screen, (150, 150, 150), (bar_x, bar_y, bar_width, bar_height), 2)
+
+        # Status text
+        if progress == 0:
+            status = "Move your eyes to the target..."
+        else:
+            status = f"Hold steady... {int(progress * 100)}%"
+        txt = font_small.render(status, True, (200, 200, 200))
+        rect = txt.get_rect(center=(screen_width // 2, 140))
+        screen.blit(txt, rect)
+
+        # Raw gaze debug
+        txt = font_small.render(f"Raw gaze: {eye_ctl.raw_gaze:.3f}", True, (150, 150, 150))
+        screen.blit(txt, (10, screen_height - 30))
+
+    else:
+        # Calibration complete
+        txt = font_large.render("Calibration Complete!", True, (100, 255, 100))
+        rect = txt.get_rect(center=(screen_width // 2, screen_height // 2 - 30))
+        screen.blit(txt, rect)
+
+        txt = font_small.render("Game starting...", True, (200, 200, 200))
+        rect = txt.get_rect(center=(screen_width // 2, screen_height // 2 + 20))
+        screen.blit(txt, rect)
+
+
 # ---------------------------
 #              MAIN
 # ---------------------------
@@ -383,6 +549,7 @@ def main():
     movement_cooldown = 0
     show_debug = False  # Toggle with 'D' key
     last_column = BOARD_WIDTH // 2  # Track last position for smoother movement
+    calibration_done_frames = 0  # Delay after calibration before starting game
 
     try:
         while True:
@@ -392,12 +559,17 @@ def main():
                     raise KeyboardInterrupt
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_SPACE and board.game_over:
-                        # restart game
+                        # restart game with recalibration
                         board = Board()
-                        eye_ctl._calibrating = True
-                        eye_ctl._calib_samples.clear()
+                        eye_ctl.reset_calibration()
                         gaze_history.clear()
                         last_column = BOARD_WIDTH // 2
+                        calibration_done_frames = 0
+                    elif event.key == pygame.K_r and not eye_ctl.is_calibrating():
+                        # Recalibrate without restarting game
+                        eye_ctl.reset_calibration()
+                        gaze_history.clear()
+                        calibration_done_frames = 0
                     elif event.key == pygame.K_d:
                         show_debug = not show_debug
                     elif event.key == pygame.K_ESCAPE:
@@ -409,6 +581,21 @@ def main():
                 break
 
             gaze_ratio, blink_left, blink_right, blink_both = eye_ctl.process(frame)
+
+            # Handle calibration phase
+            if eye_ctl.is_calibrating():
+                draw_calibration(screen, eye_ctl, screen_width, scr_h)
+                pygame.display.flip()
+                clock.tick(FPS)
+                continue
+
+            # Brief pause after calibration completes
+            if calibration_done_frames < 60:
+                calibration_done_frames += 1
+                draw_calibration(screen, eye_ctl, screen_width, scr_h)
+                pygame.display.flip()
+                clock.tick(FPS)
+                continue
 
             # Decrement movement cooldown
             if movement_cooldown > 0:
@@ -464,12 +651,12 @@ def main():
                 debug_font = pygame.font.SysFont("Arial", 14)
                 debug_y = 10
                 debug_lines = [
-                    f"Gaze: {eye_ctl.raw_gaze:.2f} (neutral: {eye_ctl.neutral_ratio:.2f})",
-                    f"Smooth: {np.mean(gaze_history) if gaze_history else 0:.2f}",
+                    f"Raw gaze: {eye_ctl.raw_gaze:.3f}",
+                    f"Calibrated: L={eye_ctl.gaze_left:.2f} C={eye_ctl.gaze_center:.2f} R={eye_ctl.gaze_right:.2f}",
+                    f"Mapped: {np.mean(gaze_history) if gaze_history else 0:.2f}",
                     f"EAR L/R: {eye_ctl.ear_left:.2f}/{eye_ctl.ear_right:.2f}",
                     f"Column: {last_column}",
-                    f"Calibrating: {eye_ctl._calibrating}",
-                    f"[D] toggle debug | [ESC] quit",
+                    f"[D] debug | [R] recalibrate | [ESC] quit",
                 ]
                 for line in debug_lines:
                     txt = debug_font.render(line, True, (0, 255, 0))
