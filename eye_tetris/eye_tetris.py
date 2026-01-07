@@ -17,8 +17,15 @@ FPS = 60
 DROP_INTERVAL = 0.7  # seconds between automatic drops
 
 # Eye‑blink thresholds (tuned empirically; may need adjustment per user)
-EAR_THRESHOLD = 0.18
-CONSEC_FRAMES_BLINK = 2
+EAR_THRESHOLD = 0.21  # Slightly higher for fewer false positives
+CONSEC_FRAMES_BLINK = 3  # Require more frames for reliable blink detection
+BLINK_COOLDOWN_FRAMES = 15  # Prevent rapid-fire blinks
+
+# Gaze control parameters
+GAZE_HISTORY_SIZE = 15  # More frames for smoother tracking
+GAZE_DEAD_ZONE = 0.15  # Center dead zone (no movement when gaze is within this range of center)
+MOVEMENT_COOLDOWN_FRAMES = 8  # Only move piece every N frames
+GAZE_SENSITIVITY = 1.2  # Amplify gaze movement outside dead zone
 
 # Colors in RGB
 COLORS = {
@@ -196,10 +203,14 @@ class EyeControl:
         )
         self.left_blink_counter = 0
         self.right_blink_counter = 0
-        self.both_blink_cooldown = 0
+        self.blink_cooldown = 0  # Cooldown counter for all blinks
         self._calibrating = True
         self._calib_samples: list[float] = []
         self.neutral_ratio = 0.5  # will be overwritten after calibration
+        # Track raw gaze for debugging overlay
+        self.raw_gaze = 0.5
+        self.ear_left = 0.0
+        self.ear_right = 0.0
 
     def _eye_gaze_ratio(self, landmarks, iris_id: int, corner_ids: Tuple[int, int]):
         outer_id, inner_id = corner_ids  # outer = temple side, inner = nose side
@@ -219,6 +230,11 @@ class EyeControl:
         blink_left = False
         blink_right = False
         blink_both = False
+
+        # Decrement blink cooldown
+        if self.blink_cooldown > 0:
+            self.blink_cooldown -= 1
+
         if results.multi_face_landmarks:
             face_landmarks = results.multi_face_landmarks[0].landmark
             # face bounding box for head‑movement compensation
@@ -230,40 +246,47 @@ class EyeControl:
             ) / 2.0
             gaze_ratio = (iris_x - x_min) / (x_max - x_min)
             # EAR for eyes
-            ear_left = eye_aspect_ratio(
+            self.ear_left = eye_aspect_ratio(
                 face_landmarks,
                 LEFT_EYE_TOP,
                 LEFT_EYE_BOTTOM,
                 LEFT_CORNER_LEFT_EYE,
                 RIGHT_CORNER_LEFT_EYE,
             )
-            ear_right = eye_aspect_ratio(
+            self.ear_right = eye_aspect_ratio(
                 face_landmarks,
                 RIGHT_EYE_TOP,
                 RIGHT_EYE_BOTTOM,
                 LEFT_CORNER_RIGHT_EYE,
                 RIGHT_CORNER_RIGHT_EYE,
             )
-            # Blink detection
-            if ear_left < EAR_THRESHOLD:
-                self.left_blink_counter += 1
-                if self.left_blink_counter == CONSEC_FRAMES_BLINK:
-                    blink_left = True
-            else:
-                self.left_blink_counter = 0
+            # Blink detection (only if not in cooldown)
+            if self.blink_cooldown == 0:
+                if self.ear_left < EAR_THRESHOLD:
+                    self.left_blink_counter += 1
+                    if self.left_blink_counter == CONSEC_FRAMES_BLINK:
+                        blink_left = True
+                else:
+                    self.left_blink_counter = 0
 
-            if ear_right < EAR_THRESHOLD:
-                self.right_blink_counter += 1
-                if self.right_blink_counter == CONSEC_FRAMES_BLINK:
-                    blink_right = True
-            else:
-                self.right_blink_counter = 0
+                if self.ear_right < EAR_THRESHOLD:
+                    self.right_blink_counter += 1
+                    if self.right_blink_counter == CONSEC_FRAMES_BLINK:
+                        blink_right = True
+                else:
+                    self.right_blink_counter = 0
 
-            # Determine both blink (simultaneous)
-            if blink_left and blink_right:
-                blink_both = True
-                blink_left = False
-                blink_right = False
+                # Determine both blink (simultaneous)
+                if blink_left and blink_right:
+                    blink_both = True
+                    blink_left = False
+                    blink_right = False
+
+                # Set cooldown if any blink detected
+                if blink_left or blink_right or blink_both:
+                    self.blink_cooldown = BLINK_COOLDOWN_FRAMES
+                    self.left_blink_counter = 0
+                    self.right_blink_counter = 0
 
             # --- Improved gaze ratio ---
             ratio_left = self._eye_gaze_ratio(
@@ -273,11 +296,12 @@ class EyeControl:
                 face_landmarks, RIGHT_IRIS_CENTER, RIGHT_EYE_CORNERS
             )
             gaze_ratio = (ratio_left + ratio_right) / 2  # 0 = looking towards temples (left), 1 = towards nose/right
+            self.raw_gaze = gaze_ratio  # Store for debug overlay
 
-            # Auto‑calibration during first 50 valid frames
+            # Auto‑calibration during first 60 valid frames (longer for stability)
             if self._calibrating:
                 self._calib_samples.append(gaze_ratio)
-                if len(self._calib_samples) >= 50:
+                if len(self._calib_samples) >= 60:
                     self.neutral_ratio = float(np.mean(self._calib_samples))
                     self._calibrating = False
             # Shift so neutral gaze centres piece
@@ -355,7 +379,10 @@ def main():
         print("Could not open webcam")
         sys.exit(1)
 
-    gaze_history: deque = deque(maxlen=5)
+    gaze_history: deque = deque(maxlen=GAZE_HISTORY_SIZE)
+    movement_cooldown = 0
+    show_debug = False  # Toggle with 'D' key
+    last_column = BOARD_WIDTH // 2  # Track last position for smoother movement
 
     try:
         while True:
@@ -363,12 +390,18 @@ def main():
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     raise KeyboardInterrupt
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE and board.game_over:
-                    # restart game
-                    board = Board()
-                    eye_ctl._calibrating = True
-                    eye_ctl._calib_samples.clear()
-                    gaze_history.clear()
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_SPACE and board.game_over:
+                        # restart game
+                        board = Board()
+                        eye_ctl._calibrating = True
+                        eye_ctl._calib_samples.clear()
+                        gaze_history.clear()
+                        last_column = BOARD_WIDTH // 2
+                    elif event.key == pygame.K_d:
+                        show_debug = not show_debug
+                    elif event.key == pygame.K_ESCAPE:
+                        raise KeyboardInterrupt
 
             # Capture frame
             ret, frame = cap.read()
@@ -377,11 +410,37 @@ def main():
 
             gaze_ratio, blink_left, blink_right, blink_both = eye_ctl.process(frame)
 
+            # Decrement movement cooldown
+            if movement_cooldown > 0:
+                movement_cooldown -= 1
+
             if gaze_ratio is not None:
                 gaze_history.append(gaze_ratio)
                 smooth_ratio = np.mean(gaze_history)
-                column = int(smooth_ratio * BOARD_WIDTH)
-                board.move_horizontal(column)
+
+                # Apply dead zone: only move if gaze is outside center region
+                center_offset = smooth_ratio - 0.5  # -0.5 to +0.5
+
+                if abs(center_offset) > GAZE_DEAD_ZONE and movement_cooldown == 0:
+                    # Scale movement outside dead zone
+                    if center_offset > 0:
+                        adjusted = (center_offset - GAZE_DEAD_ZONE) / (0.5 - GAZE_DEAD_ZONE)
+                    else:
+                        adjusted = (center_offset + GAZE_DEAD_ZONE) / (0.5 - GAZE_DEAD_ZONE)
+
+                    # Apply sensitivity and convert to column
+                    adjusted = np.clip(adjusted * GAZE_SENSITIVITY, -1.0, 1.0)
+                    target_column = int((adjusted + 1) / 2 * BOARD_WIDTH)
+                    target_column = max(0, min(BOARD_WIDTH - 1, target_column))
+
+                    # Move one step toward target for smoother control
+                    if target_column > last_column:
+                        last_column += 1
+                    elif target_column < last_column:
+                        last_column -= 1
+
+                    board.move_horizontal(last_column)
+                    movement_cooldown = MOVEMENT_COOLDOWN_FRAMES
 
             if blink_both:
                 board.drop(rows=2)
@@ -399,6 +458,34 @@ def main():
                 txt = font.render("GAME OVER", True, (255, 0, 0))
                 rect = txt.get_rect(center=(BOARD_WIDTH * BLOCK_W // 2, BOARD_HEIGHT * BLOCK_H // 2))
                 screen.blit(txt, rect)
+
+            # Debug overlay (toggle with 'D' key)
+            if show_debug:
+                debug_font = pygame.font.SysFont("Arial", 14)
+                debug_y = 10
+                debug_lines = [
+                    f"Gaze: {eye_ctl.raw_gaze:.2f} (neutral: {eye_ctl.neutral_ratio:.2f})",
+                    f"Smooth: {np.mean(gaze_history) if gaze_history else 0:.2f}",
+                    f"EAR L/R: {eye_ctl.ear_left:.2f}/{eye_ctl.ear_right:.2f}",
+                    f"Column: {last_column}",
+                    f"Calibrating: {eye_ctl._calibrating}",
+                    f"[D] toggle debug | [ESC] quit",
+                ]
+                for line in debug_lines:
+                    txt = debug_font.render(line, True, (0, 255, 0))
+                    screen.blit(txt, (5, debug_y))
+                    debug_y += 16
+
+                # Draw gaze indicator bar at top
+                bar_width = BOARD_WIDTH * BLOCK_W
+                gaze_x = int(np.mean(gaze_history) * bar_width) if gaze_history else bar_width // 2
+                pygame.draw.rect(screen, (50, 50, 50), (0, 0, bar_width, 6))
+                # Draw dead zone
+                dead_left = int((0.5 - GAZE_DEAD_ZONE) * bar_width)
+                dead_right = int((0.5 + GAZE_DEAD_ZONE) * bar_width)
+                pygame.draw.rect(screen, (80, 80, 0), (dead_left, 0, dead_right - dead_left, 6))
+                # Draw gaze position
+                pygame.draw.rect(screen, (0, 255, 0), (gaze_x - 3, 0, 6, 6))
 
             pygame.display.flip()
             clock.tick(FPS)
